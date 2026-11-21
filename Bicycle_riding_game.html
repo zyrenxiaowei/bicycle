@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Single Track — 自行车骑行</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    background: #050810; font-family: "JetBrains Mono", Consolas, monospace;
+  }
+  #game { display: block; cursor: none; }
+  #hud {
+    position: absolute; top: 12px; left: 16px;
+    color: #7ef9c5; text-shadow: 0 0 6px rgba(126, 249, 197, .7);
+    font-size: 14px; line-height: 1.6; user-select: none; pointer-events: none;
+  }
+  #hud .big { font-size: 22px; color: #fff; }
+  #balanceWrap {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    width: 260px; height: 18px; border: 1px solid rgba(126,249,197,.4);
+    border-radius: 9px; overflow: hidden; user-select: none; pointer-events: none;
+  }
+  #balanceFill {
+    position: absolute; top: 0; bottom: 0; left: 50%;
+    background: linear-gradient(90deg, #ff5e7a, #7ef9c5);
+    width: 4px; box-shadow: 0 0 8px #7ef9c5; transition: none;
+  }
+  #crashOverlay {
+    position: absolute; inset: 0; background: rgba(10, 0, 20, .75);
+    display: none; align-items: center; justify-content: center;
+    flex-direction: column; color: #ff5e7a; font-size: 40px;
+    text-shadow: 0 0 20px rgba(255, 94, 122, .8); user-select: none;
+    backdrop-filter: blur(3px);
+  }
+  #crashOverlay small { font-size: 16px; color: #9aa; margin-top: 12px; }
+  #startScreen {
+    position: absolute; inset: 0; background: rgba(5, 8, 16, .88);
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; color: #7ef9c5; user-select: none;
+  }
+  #startScreen h1 { font-size: 42px; margin: 0 0 18px; color: #fff; letter-spacing: 6px; }
+  #startScreen .keys { font-size: 14px; line-height: 2; color: #9ab; max-width: 460px; }
+  #startScreen .keys b { color: #7ef9c5; }
+  #startScreen button {
+    margin-top: 24px; padding: 12px 48px; font-size: 18px;
+    background: transparent; color: #7ef9c5; border: 1px solid #7ef9c5;
+    border-radius: 4px; cursor: pointer; letter-spacing: 3px;
+    transition: all .25s;
+  }
+  #startScreen button:hover { background: #7ef9c5; color: #050810; box-shadow: 0 0 20px #7ef9c5; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud">
+  <div class="big"><span id="speed">0</span> km/h</div>
+  <div>里程 <span id="dist">0</span> m &nbsp;|&nbsp; 最佳 <span id="best">0</span> m</div>
+  <div>档位 <span id="gear">3</span> &nbsp;|&nbsp; 踏频 <span id="cadence">—</span></div>
+</div>
+
+<div id="balanceWrap"><div id="balanceFill"></div></div>
+
+<div id="crashOverlay">
+  <div>摔 车 !</div>
+  <small>按 R 重新上车 · 当前里程 <span id="crashDist">0</span> m</small>
+</div>
+
+<div id="startScreen">
+  <h1>SINGLE TRACK</h1>
+  <div class="keys">
+    <b>→ / D</b> 踩踏加速（踏频峰值时效率最高）<br>
+    <b>← / A</b> 刹车（低速时倒退）<br>
+    <b>↑ / W</b> 重心后移 · 拉前轮 / 空中后仰<br>
+    <b>↓ / S</b> 重心前移 · 压前轮 / 空中前倾<br>
+    <b>空格</b> 兔跳 &nbsp; <b>Q / E</b> 降档 / 升档 &nbsp; <b>R</b> 摔车后复位<br>
+    <span style="color:#667">上坡记得降档，下坡用高档冲速度；空中俯仰角与坡面偏差过大会摔车。</span>
+  </div>
+  <button id="startBtn">开 骑</button>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+// ============ 基础 ============
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  cvs.width = W * DPR; cvs.height = H * DPR;
+  cvs.style.width = W + 'px'; cvs.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ============ 输入 ============
+const keys = {}, just = {};
+window.addEventListener('keydown', e => {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (!keys[k]) just[k] = true;
+  keys[k] = true;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+});
+window.addEventListener('keyup', e => {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  keys[k] = false;
+});
+
+// ============ 地形 ============
+function terrainY(x) {
+  let y = 0;
+  y += Math.sin(x * 0.0035) * 110;
+  y += Math.sin(x * 0.008  + 1.3) * 55;
+  y += Math.sin(x * 0.021  + 2.7) * 24;
+  y += Math.sin(x * 0.045  + 0.5) * 10;
+  y += Math.sin(x * 0.11   + 4.1) * 4;
+  return y;
+}
+function terrainSlopeAngle(x) {
+  const d = 6;
+  const dy = terrainY(x + d) - terrainY(x - d);
+  return Math.atan2(dy, 2 * d);
+}
+
+// ============ 世界状态 ============
+const WHEELBASE = 46;
+const GRAV = 760;
+const CRASH_ANGLE = 1.35;
+const PEDAL_POWER = 330;
+
+const gears = [
+  { ratio: 0.42, label: '1' },
+  { ratio: 0.58, label: '2' },
+  { ratio: 0.75, label: '3' },
+  { ratio: 0.92, label: '4' },
+  { ratio: 1.10, label: '5' },
+  { ratio: 1.30, label: '6' },
+];
+
+const w = {
+  x: 100, y: 0,
+  speed: 0, vy: 0,
+  pitch: 0, pitchVel: 0,
+  onGround: true,
+  gearIdx: 2,
+  cadencePhase: 0, cadenceEff: 0,
+  airborne: false,
+  crashed: false, crashTimer: 0, crashReason: '',
+  maxDist: 0, dist: 0,
+  wheelSpin: 0,
+  pedalStroke: 0,
+};
+
+function reset(full) {
+  const best = w.maxDist;
+  w.x = 100; w.speed = 0; w.vy = 0;
+  w.pitch = -terrainSlopeAngle(100);
+  w.pitchVel = 0; w.onGround = true; w.airborne = false;
+  w.crashed = false; w.crashTimer = 0;
+  w.y = terrainY(100);
+  w.dist = 0;
+  if (!full) w.maxDist = best;
+  document.getElementById('crashOverlay').style.display = 'none';
+}
+
+// ============ 相机 ============
+const cam = { x: 0, y: 0, zoom: 1 };
+function updateCam(dt) {
+  const tx = w.x + Math.min(w.speed, 260) * 0.45;
+  const ty = w.y;
+  cam.x += (tx - cam.x) * Math.min(1, 5 * dt);
+  cam.y += (ty - cam.y) * Math.min(1, 3.5 * dt);
+  const targetZoom = Math.max(0.65, 1 - Math.abs(w.speed) / 900);
+  cam.zoom += (targetZoom - cam.zoom) * Math.min(1, 2 * dt);
+}
+
+// ============ 物理 ============
+function crash(reason) {
+  if (w.crashed) return;
+  w.crashed = true; w.crashReason = reason; w.crashTimer = 0;
+  w.pitchVel = (Math.random() - 0.5) * 8;
+  w.speed *= 0.4;
+  const ov = document.getElementById('crashOverlay');
+  ov.style.display = 'flex';
+  document.getElementById('crashDist').textContent = Math.floor(w.dist);
+}
+
+function update(dt) {
+  if (w.crashed) {
+    w.crashTimer += dt;
+    // 摔车惯性动画
+    w.x += w.speed * dt * 0.6;
+    w.y += w.vy * dt;
+    w.vy += GRAV * dt;
+    w.pitch += w.pitchVel * dt * 4;
+    const ground = terrainY(w.x);
+    if (w.y > ground) { w.y = ground; w.vy *= -0.3; w.speed *= 0.85; w.pitchVel *= 0.8; }
+    w.speed *= Math.pow(0.3, dt);
+    return;
+  }
+
+  // ---------- 变速 ----------
+  if (just['q'] || just['1']) w.gearIdx = Math.max(0, w.gearIdx - 1);
+  if (just['e'] || just['2']) w.gearIdx = Math.min(gears.length - 1, w.gearIdx + 1);
+  const gear = gears[w.gearIdx];
+  const maxSpeed = 150 + gear.ratio * 220;
+  const torqueMul = 1.65 - gear.ratio * 0.7;
+
+  // ---------- 输入 ----------
+  const pedal = keys['ArrowRight'] || keys['d'];
+  const brake  = keys['ArrowLeft']  || keys['a'];
+  const leanBk = keys['ArrowUp']    || keys['w'];
+  const leanFw = keys['ArrowDown']  || keys['s'];
+  const jump   = just[' '];
+
+  const slopeAng = terrainSlopeAngle(w.x);
+
+  // ---------- 踩踏（带节奏效率） ----------
+  let pedalForce = 0;
+  if (pedal && w.onGround && !w.airborne) {
+    w.cadencePhase += dt * (7 + gear.ratio * 7);
+    // 正弦模拟踏板圆周：下推段（0~π）效率高
+    const phase = w.cadencePhase % (Math.PI * 2);
+    const eff = Math.max(0.15, Math.sin(phase));
+    w.cadenceEff += (eff - w.cadenceEff) * 0.3;
+    pedalForce = PEDAL_POWER * w.cadenceEff * torqueMul;
+    w.pedalStroke += dt * 6;
+  } else {
+    w.cadenceEff *= Math.pow(0.05, dt);
+    w.cadencePhase += dt * 0.5; // 空转缓慢
+  }
+
+  // ---------- 纵向力 ----------
+  let accel = pedalForce;
+  // 空气阻力
+  accel -= 0.0016 * w.speed * Math.abs(w.speed);
+  // 滚动阻力
+  accel -= Math.sign(w.speed) * 6;
+  // 坡度重力分量（上坡为负）
+  accel -= Math.sin(slopeAng) * GRAV * 0.72;
+  // 刹车
+  if (brake) {
+    accel -= Math.sign(w.speed) * 300;
+    if (Math.abs(w.speed) < 12) w.speed = -Math.min(60, Math.abs(w.speed) + 40 * dt * 0); // 低速倒退简化
+  }
+  // 速度上限（软限制）
+  if (w.speed > maxSpeed) accel -= (w.speed - maxSpeed) * 2.5;
+
+  w.speed += accel * dt;
+  if (!pedal && !brake && Math.abs(w.speed) < 4) w.speed *= Math.pow(0.02, dt);
+
+  // ---------- 平衡 / 空中姿态 ----------
+  if (!w.airborne) {
+    // 地面：车架倾向贴合坡面，但 wheelie / 前压时分离
+    const targetPitch = -slopeAng;
+    if (leanBk) w.pitchVel += 3.2 * dt * Math.min(1, Math.abs(w.speed) / 50 + 0.35);
+    if (leanFw) w.pitchVel -= 2.6 * dt;
+    // 自动平衡（重力把车压回两轮着地）
+    const recover = (targetPitch - w.pitch) * 4.2;
+    w.pitchVel += recover * dt;
+    w.pitchVel *= Math.pow(0.02, dt);
+    w.pitch += w.pitchVel;
+
+    // wheelie 抬过头：摔
+    if (w.pitch < -CRASH_ANGLE) { crash('后仰过度'); return; }
+    if (w.pitch >  CRASH_ANGLE) { crash('前翻过把'); return; }
+
+    // 前轮离地检测（进入 wheelie 状态时 UI 提示）
+    // 这里不做严格的两轮刚体，只做姿态判定
+
+    // 跳跃
+    if (jump && w.onGround) {
+      w.vy = -300; w.airborne = true; w.onGround = false;
+      w.pitchVel += (Math.random() - 0.5) * 0.4;
+    }
+  } else {
+    // 空中：全手动控制俯仰
+    if (leanBk) w.pitchVel -= 2.4 * dt;
+    if (leanFw) w.pitchVel += 2.4 * dt;
+    w.pitchVel *= Math.pow(0.15, dt);
+    w.pitch += w.pitchVel;
+    // 抛物线
+    w.vy += GRAV * dt;
+    w.x += w.speed * dt * 0.9;
+    w.y += w.vy * dt;
+    // 着陆
+    const ground = terrainY(w.x);
+    if (w.y >= ground) {
+      const impact = w.vy;
+      w.y = ground; w.vy = 0; w.airborne = false; w.onGround = true;
+      const landDiff = Math.abs(w.pitch - (-terrainSlopeAngle(w.x)));
+      if (landDiff > 0.75 || impact > 720) {
+        crash(landDiff > 0.75 ? '落地角度偏差' : '落地冲击过大');
+        return;
+      }
+      w.pitch = -terrainSlopeAngle(w.x);
+      w.pitchVel *= 0.2;
+      // 落地减速
+      w.speed *= Math.pow(0.4, impact / 400);
+    }
+  }
+
+  // ---------- 位置推进 ----------
+  if (!w.airborne) {
+    w.x += w.speed * dt * Math.cos(slopeAng);
+    w.y = terrainY(w.x);
+  }
+
+  // 撞墙检测（坡度突变近似）：速度朝向陡上坡
+  const aheadAng = terrainSlopeAngle(w.x + 12);
+  if (!w.airborne && w.speed > 130 && aheadAng - slopeAng > 0.85) {
+    crash('正面撞击陡坡');
+    return;
+  }
+
+  // ---------- 距离 / 最佳 ----------
+  w.dist = Math.max(0, (w.x - 100) / 10);
+  if (w.dist > w.maxDist) w.maxDist = w.dist;
+
+  // ---------- 车轮转速 ----------
+  w.wheelSpin += (w.speed / 14) * dt;
+}
+
+// ============ 渲染 ============
+function drawBackground() {
+  // 天空渐变
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#0a1228');
+  sky.addColorStop(0.5, '#141d3a');
+  sky.addColorStop(1, '#1d2d4f');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // 星星
+  ctx.save();
+  for (let i = 0; i < 80; i++) {
+    const sx = (i * 947.3 + 137) % W;
+    const sy = (i * 631.7 + 89) % (H * 0.55);
+    const tw = 0.5 + 0.5 * Math.sin(performance.now() * 0.002 + i);
+    ctx.fillStyle = `rgba(180, 210, 255, ${0.25 + tw * 0.5})`;
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  ctx.restore();
+
+  // 远山（视差层 1）
+  drawParallax(0.15, 340, '#1a2a4a', 1.8, 0.004);
+  drawParallax(0.32, 260, '#22355c', 1.2, 0.008);
+}
+
+function drawParallax(factor, baseY, color, amp, freq) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(0, H);
+  for (let sx = 0; sx <= W; sx += 8) {
+    const wx = (cam.x * factor) + sx;
+    const y = baseY - cam.y * factor * 0.3
+      + Math.sin(wx * freq) * amp
+      + Math.sin(wx * freq * 2.7 + 1.5) * amp * 0.35;
+    ctx.lineTo(sx, y);
+  }
+  ctx.lineTo(W, H);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function worldToScreen(wx, wy) {
+  const cx = W * 0.38, cy = H * 0.55;
+  return [
+    cx + (wx - cam.x) * cam.zoom,
+    cy + (wy - cam.y) * cam.zoom
+  ];
+}
+
+function drawTerrain() {
+  ctx.save();
+  ctx.beginPath();
+  // 从屏幕左侧扫到右侧
+  const step = 6 / cam.zoom;
+  let first = true;
+  const camLeft = cam.x - (W * 0.4) / cam.zoom;
+  const camRight = cam.x + (W * 0.65) / cam.zoom;
+  for (let wx = camLeft; wx <= camRight; wx += step) {
+    const [sx, sy] = worldToScreen(wx, terrainY(wx));
+    if (first) { ctx.moveTo(sx, sy); first = false; }
+    else ctx.lineTo(sx, sy);
+  }
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+
+  const grad = ctx.createLinearGradient(0, H * 0.3, 0, H);
+  grad.addColorStop(0, '#1c3a2f');
+  grad.addColorStop(0.4, '#14251e');
+  grad.addColorStop(1, '#0a1512');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // 顶部发光描边
+  ctx.beginPath();
+  first = true;
+  for (let wx = camLeft; wx <= camRight; wx += step) {
+    const [sx, sy] = worldToScreen(wx, terrainY(wx));
+    if (first) { ctx.moveTo(sx, sy); first = false; }
+    else ctx.lineTo(sx, sy);
+  }
+  ctx.strokeStyle = 'rgba(126, 249, 197, 0.9)';
+  ctx.lineWidth = 2;
+  ctx.shadowColor = '#7ef9c5';
+  ctx.shadowBlur = 10;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawBike() {
+  const [bx, by] = worldToScreen(w.x, w.y - 14);
+  const s = cam.zoom;
+
+  ctx.save();
+  ctx.translate(bx, by);
+  ctx.rotate(-w.pitch);
+  ctx.scale(s, s);
+
+  // 后轮
+  drawWheel(-WHEELBASE / 2, 14, w.wheelSpin);
+  // 前轮
+  drawWheel( WHEELBASE / 2, 14, w.wheelSpin);
+
+  // 车架（菱形）
+  ctx.strokeStyle = '#7ef9c5';
+  ctx.lineWidth = 2.5;
+  ctx.shadowColor = '#7ef9c5'; ctx.shadowBlur = 6;
+  ctx.beginPath();
+  // 后叉
+  ctx.moveTo(-WHEELBASE/2, 14); ctx.lineTo(-WHEELBASE/6, -4);
+  ctx.lineTo(-WHEELBASE/6, -4); ctx.lineTo(WHEELBASE/6, -4);
+  // 前叉
+  ctx.moveTo(WHEELBASE/6, -4); ctx.lineTo(WHEELBASE/2, 14);
+  // 上管 / 立管 / 座管
+  ctx.moveTo(-WHEELBASE/6, -4); ctx.lineTo(-4, -22);
+  ctx.moveTo(-4, -22); ctx.lineTo(WHEELBASE/6, -4);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // 车座
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(-12, -28, 16, 3);
+
+  // 车把
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(WHEELBASE/6, -4);
+  ctx.lineTo(WHEELBASE/6 + 4, -20);
+  ctx.lineTo(WHEELBASE/6 + 12, -22);
+  ctx.stroke();
+
+  // 骑手（简化火柴人，随踏板摆动）
+  const swing = Math.sin(w.pedalStroke) * 3;
+  ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  // 躯干
+  ctx.moveTo(-4, -26); ctx.lineTo(4, -44);
+  // 手臂
+  ctx.moveTo(4, -44); ctx.lineTo(WHEELBASE/6 + 8, -22);
+  // 大腿（随踏板）
+  ctx.moveTo(-4, -26); ctx.lineTo(4 + swing, -10);
+  ctx.moveTo(-4, -26); ctx.lineTo(4 - swing, -10);
+  // 小腿
+  ctx.moveTo(4 + swing, -10); ctx.lineTo(4, 8);
+  ctx.moveTo(4 - swing, -10); ctx.lineTo(-4, 8);
+  ctx.stroke();
+  // 头
+  ctx.fillStyle = '#ffd166';
+  ctx.beginPath(); ctx.arc(6, -50, 4, 0, Math.PI * 2); ctx.fill();
+
+  // 踏频光环
+  if (w.cadenceEff > 0.1) {
+    ctx.strokeStyle = `rgba(255, 209, 102, ${0.25 + w.cadenceEff * 0.5})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 4, 26 + w.cadenceEff * 6, 0, Math.PI * 2 * w.cadenceEff);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function drawWheel(ox, oy, spin) {
+  ctx.save();
+  ctx.translate(ox, oy);
+  ctx.strokeStyle = '#cfe'; ctx.lineWidth = 2.5;
+  ctx.shadowColor = '#7ef9c5'; ctx.shadowBlur = 8;
+  ctx.beginPath(); ctx.arc(0, 0, 13, 0, Math.PI * 2); ctx.stroke();
+  ctx.shadowBlur = 0;
+  // 辐条
+  ctx.strokeStyle = 'rgba(200, 230, 255, 0.7)'; ctx.lineWidth = 1;
+  for (let i = 0; i < 6; i++) {
+    const a = spin + i * Math.PI / 3;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * 2, Math.sin(a) * 2);
+    ctx.lineTo(Math.cos(a) * 12, Math.sin(a) * 12);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHUD() {
+  document.getElementById('speed').textContent = Math.round(Math.abs(w.speed) * 0.36);
+  document.getElementById('dist').textContent = Math.floor(w.dist);
+  document.getElementById('best').textContent = Math.floor(w.maxDist);
+  document.getElementById('gear').textContent = gears[w.gearIdx].label;
+  document.getElementById('cadence').textContent = w.cadenceEff > 0.05
+    ? Math.round(w.cadenceEff * 100) + '%' : '—';
+
+  // 平衡条：pitch 0 = 居中（绿），偏移越大越红
+  const bf = document.getElementById('balanceFill');
+  const norm = Math.max(-1, Math.min(1, w.pitch / CRASH_ANGLE));
+  const px = 50 + norm * 48;
+  bf.style.left = px + '%';
+  bf.style.background = Math.abs(norm) > 0.65 ? '#ff5e7a' : Math.abs(norm) > 0.35 ? '#ffd166' : '#7ef9c5';
+  bf.style.boxShadow = `0 0 10px ${bf.style.background}`;
+}
+
+// ============ 主循环 ============
+let running = false, lastT = 0;
+function loop(t) {
+  const dt = Math.min(0.033, (t - lastT) / 1000 || 0.016);
+  lastT = t;
+
+  if (running) {
+    update(dt);
+    updateCam(dt);
+  }
+
+  drawBackground();
+  drawTerrain();
+  drawBike();
+  drawHUD();
+
+  // 清空 justPressed
+  for (const k in just) just[k] = false;
+
+  // 摔车后按 R 复位
+  if (w.crashed && (just['r'] || keys['r'])) {
+    // 在下一帧处理，这里只设置标志
+  }
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// R 键处理
+window.addEventListener('keydown', e => {
+  if (e.key.toLowerCase() === 'r' && w.crashed) {
+    reset(false);
+  }
+});
+
+// ============ 启动 ============
+document.getElementById('startBtn').addEventListener('click', () => {
+  document.getElementById('startScreen').style.display = 'none';
+  reset(true);
+  running = true;
+});
+
+// 初始化相机
+cam.x = 100; cam.y = terrainY(100);
+w.y = terrainY(100);
+w.pitch = -terrainSlopeAngle(100);
+
+})();
+</script>
+</body>
+</html>
